@@ -1,6 +1,6 @@
 """
 BatchJob: implements miniwdl TaskContainer by submitting jobs to an AWS Batch queue and polling
-their status. Assumes a shared filesystem (typically EFS) between the miniwdl host and the Batch
+their status. Assumes a shared filesystem (FSx Lustre) between the miniwdl host and the Batch
 workers.
 """
 
@@ -20,10 +20,6 @@ from WDL._util import StructuredLogMessage as _
 from ._util import (
     detect_aws_region,
     randomize_job_name,
-    efs_id_from_access_point,
-    detect_sagemaker_studio_efs,
-    detect_studio_fsap,
-    detect_gwfcore_batch_queue,
 )
 
 
@@ -35,62 +31,25 @@ class BatchJob(WDL.runtime.task_container.TaskContainer):
             cls._region_name
         ), "Failed to detect AWS region; configure AWS CLI or set environment AWS_DEFAULT_REGION"
 
-        # EFS configuration based on:
-        # - [aws] fsap / MINIWDL__AWS__FSAP
+        # FSx Lustre configuration based on:
         # - [aws] fs / MINIWDL__AWS__FS
-        # - SageMaker Studio metadata, if applicable
+
         cls._fs_id = None
-        cls._fsap_id = None
         cls._fs_mount = cfg.get("file_io", "root")
         assert (
             len(cls._fs_mount) > 1
-        ), "misconfiguration, set [file_io] root / MINIWDL__FILE_IO__ROOT to EFS mount point"
+        ), "misconfiguration, set [file_io] root / MINIWDL__FILE_IO__ROOT to Fsx mount point"
         if cfg.has_option("aws", "fs"):
             cls._fs_id = cfg.get("aws", "fs")
-        if cfg.has_option("aws", "fsap"):
-            cls._fsap_id = cfg.get("aws", "fsap")
-            if not cls._fs_id:
-                cls._fs_id = efs_id_from_access_point(cls._region_name, cls._fsap_id)
-        sagemaker_studio_efs = detect_sagemaker_studio_efs(logger, region_name=cls._region_name)
-        if sagemaker_studio_efs:
-            (
-                studio_efs_id,
-                studio_efs_uid,
-                studio_efs_home,
-                studio_efs_mount,
-            ) = sagemaker_studio_efs
-            assert (
-                not cls._fs_id or cls._fs_id == studio_efs_id
-            ), "Configured EFS ([aws] fs / MINIWDL__AWS__FS, [aws] fsap / MINIWDL__AWS__FSAP) isn't associated with current SageMaker Studio domain EFS"
-            cls._fs_id = studio_efs_id
-            assert cls._fs_mount.rstrip("/") == studio_efs_mount.rstrip("/"), (
-                "misconfiguration, set [file_io] root / MINIWDL__FILE_IO__ROOT to "
-                + studio_efs_mount.rstrip("/")
-            )
-            if not cls._fsap_id:
-                cls._fsap_id = detect_studio_fsap(
-                    logger,
-                    studio_efs_id,
-                    studio_efs_uid,
-                    studio_efs_home,
-                    region_name=cls._region_name,
-                )
-                assert (
-                    cls._fsap_id
-                ), "Unable to detect suitable EFS Access Point for use with SageMaker Studio; set [aws] fsap / MINIWDL__AWS__FSAP"
-            # TODO: else sanity-check that FSAP's root directory equals studio_efs_home
+
         assert (
             cls._fs_id
-        ), "Missing EFS configuration ([aws] fs / MINIWDL__AWS__FS or [aws] fsap / MINIWDL__AWS__FSAP)"
-        if not cls._fsap_id:
-            logger.warning(
-                "AWS BatchJob plugin recommends using EFS Access Point to simplify permissions between containers (configure [aws] fsap / MINIWDL__AWS__FSAP to fsap-xxxx)"
-            )
+        ), "Missing Fsx configuration ([aws] fs / MINIWDL__AWS__FS)"
+
         logger.debug(
             _(
-                "AWS BatchJob EFS configuration",
+                "AWS BatchJob Fsx configuration",
                 fs_id=cls._fs_id,
-                fsap_id=cls._fsap_id,
                 mount=cls._fs_mount,
             )
         )
@@ -98,10 +57,6 @@ class BatchJob(WDL.runtime.task_container.TaskContainer):
         # set AWS Batch job queue
         if cfg.has_option("aws", "task_queue"):
             cls._job_queue = cfg.get("aws", "task_queue")
-        elif sagemaker_studio_efs:
-            cls._job_queue = detect_gwfcore_batch_queue(
-                logger, sagemaker_studio_efs[0], region_name=cls._region_name
-            )
         assert (
             cls._job_queue
         ), "Missing AWS Batch job queue configuration ([aws] task_queue / MINIWDL__AWS__TASK_QUEUE)"
@@ -130,8 +85,8 @@ class BatchJob(WDL.runtime.task_container.TaskContainer):
         self._observed_states = set()
         self._logStreamName = None
         self._inputs_copied = False
-        # We'll direct Batch to mount EFS inside the task container at the same location we have
-        # it mounted ourselves, namely /mnt/efs. Therefore container_dir will be the same as
+        # We'll direct Batch to mount FSx Lustre inside the task container at the same location we have
+        # it mounted ourselves, namely /mnt/fsx. Therefore container_dir will be the same as
         # host_dir (unlike the default Swarm backend, which mounts it at a different virtualized
         # location)
         self.container_dir = self.host_dir
@@ -311,21 +266,15 @@ class BatchJob(WDL.runtime.task_container.TaskContainer):
         with open(self.host_stderr_txt(), "w"):
             pass
 
-        # EFS mount point
+        # FSx mount point
         volumes = [
             {
-                "name": "efs",
-                "efsVolumeConfiguration": {
-                    "fileSystemId": self._fs_id,
-                    "transitEncryption": "ENABLED",
-                },
+                "host": {"sourcePath": "/mnt/fsx"},
+                "name": "fsx",
             }
         ]
-        if self._fsap_id:
-            volumes[0]["efsVolumeConfiguration"]["authorizationConfig"] = {
-                "accessPointId": self._fsap_id
-            }
-        mount_points = [{"containerPath": self._fs_mount, "sourceVolume": "efs"}]
+
+        mount_points = [{"containerPath": self._fs_mount, "sourceVolume": "fsx"}]
 
         if self._inputs_copied:
             return volumes, mount_points
