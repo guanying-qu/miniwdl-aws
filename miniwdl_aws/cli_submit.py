@@ -107,7 +107,7 @@ def miniwdl_submit_awsbatch(argv):
         if args.workflow_role
         else os.environ.get("MINIWDL__AWS__WORKFLOW_ROLE", None)
     )
-    if not (args.fsap.startswith("fsid-") and args.workflow_queue and args.task_queue):
+    if not (args.fsid.startswith("fsid-") and args.workflow_queue and args.task_queue):
         print(
             "--fsid, --workflow-queue, and --task-queue all required (or environment variables MINIWDL__AWS__FSID, MINIWDL__AWS__WORKFLOW_QUEUE, MINIWDL__AWS__TASK_QUEUE)",
             file=sys.stderr,
