@@ -30,7 +30,7 @@ miniwdl-aws-submit \
   sample_name=G5012.3 \
   --workflow-queue miniwdl_workflow \
   --task-queue miniwdl_task \
-  --filesystem efs
+  --filesystem efs \
   --fsap fsap-xxxx \
   --s3upload s3://MY_BUCKET/test \
   --follow
