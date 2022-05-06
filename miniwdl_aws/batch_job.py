@@ -1,6 +1,6 @@
 """
 BatchJob: implements miniwdl TaskContainer by submitting jobs to an AWS Batch queue and polling
-their status. Assumes a shared filesystem (FSx Lustre) between the miniwdl host and the Batch
+their status. Assumes a shared filesystem (typically EFS) between the miniwdl host and the Batch
 workers.
 """
 
@@ -20,10 +20,14 @@ from WDL._util import StructuredLogMessage as _
 from ._util import (
     detect_aws_region,
     randomize_job_name,
+    efs_id_from_access_point,
+    detect_sagemaker_studio_efs,
+    detect_studio_fsap,
+    detect_gwfcore_batch_queue,
 )
+from abc import ABC, abstractmethod
 
-
-class BatchJob(WDL.runtime.task_container.TaskContainer):
+class BatchJob(WDL.runtime.task_container.TaskContainer, ABC):
     @classmethod
     def global_init(cls, cfg, logger):
         cls._region_name = detect_aws_region(cfg)
@@ -31,25 +35,71 @@ class BatchJob(WDL.runtime.task_container.TaskContainer):
             cls._region_name
         ), "Failed to detect AWS region; configure AWS CLI or set environment AWS_DEFAULT_REGION"
 
-        # FSx Lustre configuration based on:
+        # EFS configuration based on:
+        # - [aws] fsap / MINIWDL__AWS__FSAP
         # - [aws] fs / MINIWDL__AWS__FS
-
+        # - SageMaker Studio metadata, if applicable
         cls._fs_id = None
+        cls._fsap_id = None
         cls._fs_mount = cfg.get("file_io", "root")
+        #check which filesystem is used
+        cls._filesystem = None
+        if cls._fs_mount.startswith("/mnt/efs"):
+            cls._filesystem = 'efs'
+        elif cls._fs_mount.startswith("/mnt/fsx"):
+            cls._filesystem = 'fsx'
+
         assert (
             len(cls._fs_mount) > 1
-        ), "misconfiguration, set [file_io] root / MINIWDL__FILE_IO__ROOT to Fsx mount point"
+        ), "misconfiguration, set [file_io] root / MINIWDL__FILE_IO__ROOT to EFS mount point"
         if cfg.has_option("aws", "fs"):
             cls._fs_id = cfg.get("aws", "fs")
-
+        if cfg.has_option("aws", "fsap"):
+            cls._fsap_id = cfg.get("aws", "fsap")
+            if not cls._fs_id:
+                cls._fs_id = efs_id_from_access_point(cls._region_name, cls._fsap_id)
+        cls._studio_efs_uid = None
+        sagemaker_studio_efs = detect_sagemaker_studio_efs(logger, region_name=cls._region_name)
+        if sagemaker_studio_efs:
+            (
+                studio_efs_id,
+                studio_efs_uid,
+                studio_efs_home,
+                studio_efs_mount,
+            ) = sagemaker_studio_efs
+            assert (
+                not cls._fs_id or cls._fs_id == studio_efs_id
+            ), "Configured EFS ([aws] fs / MINIWDL__AWS__FS, [aws] fsap / MINIWDL__AWS__FSAP) isn't associated with current SageMaker Studio domain EFS"
+            cls._fs_id = studio_efs_id
+            assert cls._fs_mount.rstrip("/") == studio_efs_mount.rstrip("/"), (
+                "misconfiguration, set [file_io] root / MINIWDL__FILE_IO__ROOT to "
+                + studio_efs_mount.rstrip("/")
+            )
+            cls._studio_efs_uid = studio_efs_uid
+            if not cls._fsap_id:
+                cls._fsap_id = detect_studio_fsap(
+                    logger,
+                    studio_efs_id,
+                    studio_efs_uid,
+                    studio_efs_home,
+                    region_name=cls._region_name,
+                )
+                assert (
+                    cls._fsap_id
+                ), "Unable to detect suitable EFS Access Point for use with SageMaker Studio; set [aws] fsap / MINIWDL__AWS__FSAP"
+            # TODO: else sanity-check that FSAP's root directory equals studio_efs_home
         assert (
             cls._fs_id
-        ), "Missing Fsx configuration ([aws] fs / MINIWDL__AWS__FS)"
-
+        ), "Missing EFS configuration ([aws] fs / MINIWDL__AWS__FS or [aws] fsap / MINIWDL__AWS__FSAP)"
+        if not cls._fsap_id:
+            logger.warning(
+                "AWS BatchJob plugin recommends using EFS Access Point to simplify permissions between containers (configure [aws] fsap / MINIWDL__AWS__FSAP to fsap-xxxx)"
+            )
         logger.debug(
             _(
-                "AWS BatchJob Fsx configuration",
+                "AWS BatchJob EFS configuration",
                 fs_id=cls._fs_id,
+                fsap_id=cls._fsap_id,
                 mount=cls._fs_mount,
             )
         )
@@ -57,6 +107,10 @@ class BatchJob(WDL.runtime.task_container.TaskContainer):
         # set AWS Batch job queue
         if cfg.has_option("aws", "task_queue"):
             cls._job_queue = cfg.get("aws", "task_queue")
+        elif sagemaker_studio_efs:
+            cls._job_queue = detect_gwfcore_batch_queue(
+                logger, sagemaker_studio_efs[0], region_name=cls._region_name
+            )
         assert (
             cls._job_queue
         ), "Missing AWS Batch job queue configuration ([aws] task_queue / MINIWDL__AWS__TASK_QUEUE)"
@@ -85,8 +139,8 @@ class BatchJob(WDL.runtime.task_container.TaskContainer):
         self._observed_states = set()
         self._logStreamName = None
         self._inputs_copied = False
-        # We'll direct Batch to mount FSx Lustre inside the task container at the same location we have
-        # it mounted ourselves, namely /mnt/fsx. Therefore container_dir will be the same as
+        # We'll direct Batch to mount EFS inside the task container at the same location we have
+        # it mounted ourselves, namely /mnt/efs. Therefore container_dir will be the same as
         # host_dir (unlike the default Swarm backend, which mounts it at a different virtualized
         # location)
         self.container_dir = self.host_dir
@@ -180,56 +234,22 @@ class BatchJob(WDL.runtime.task_container.TaskContainer):
         # concurrent RegisterJobDefinition requests
         job_name = randomize_job_name(job_name)
 
-        image_tag = self.runtime_values.get("docker", "ubuntu:20.04")
-        volumes, mount_points = self._prepare_mounts(logger, command)
-        vcpu = self.runtime_values.get("cpu", 1)
-        memory_mbytes = max(
-            math.ceil(self.runtime_values.get("memory_reservation", 0) / 1048576), 1024
-        )
-        commands = [
-            f"cd {self.container_dir}/work",
-            "exit_code=0",
-            "bash ../command >> ../stdout.txt 2> >(tee -a ../stderr.txt >&2) || exit_code=$?",
-        ]
-        if self.cfg.has_option("aws", "container_sync") and self.cfg.get_bool(
-            "aws", "container_sync"
-        ):
-            commands.append("find . -type f | xargs sync")
-            commands.append("sync ../stdout.txt ../stderr.txt")
-        commands.append("exit $exit_code")
-
+        container_properties = self._prepare_container_properties(logger, command)
         job_def = aws_batch.register_job_definition(
             jobDefinitionName=job_name,
             type="container",
-            containerProperties={
-                "image": image_tag,
-                "volumes": volumes,
-                "mountPoints": mount_points,
-                "command": ["/bin/bash", "-ec", "\n".join(commands)],
-                "resourceRequirements": [
-                    {"type": "VCPU", "value": str(vcpu)},
-                    {"type": "MEMORY", "value": str(memory_mbytes)},
-                ],
-            },
+            containerProperties=container_properties,
         )
         job_def_handle = f"{job_def['jobDefinitionName']}:{job_def['revision']}"
-        logger.debug(_("registered Batch job definition", jobDefinition=job_def_handle))
+        logger.debug(
+            _(
+                "registered Batch job definition",
+                jobDefinition=job_def_handle,
+                **container_properties,
+            )
+        )
 
-        def deregister(logger, aws_batch, job_def_handle):
-            try:
-                aws_batch.deregister_job_definition(jobDefinition=job_def_handle)
-                logger.debug(_("deregistered Batch job definition", jobDefinition=job_def_handle))
-            except botocore.exceptions.ClientError as exn:
-                # AWS expires job definitions after 6mo, so failing to delete them isn't fatal
-                logger.warning(
-                    _(
-                        "failed to deregister Batch job definition",
-                        jobDefinition=job_def_handle,
-                        error=str(AWSError(exn)),
-                    )
-                )
-
-        cleanup.callback(deregister, logger, aws_batch, job_def_handle)
+        self._cleanup_job_definition(logger, cleanup, aws_batch, job_def_handle)
 
         job_tags = {}
         if self.cfg.has_option("aws", "job_tags"):
@@ -256,6 +276,50 @@ class BatchJob(WDL.runtime.task_container.TaskContainer):
         )
         return job["jobId"]
 
+    def _prepare_container_properties(self, logger, command):
+        image_tag = self.runtime_values.get("docker", "ubuntu:20.04")
+        volumes, mount_points = self._prepare_mounts(logger, command)
+        vcpu = self.runtime_values.get("cpu", 1)
+        memory_mbytes = max(
+            math.ceil(self.runtime_values.get("memory_reservation", 0) / 1048576), 1024
+        )
+        commands = [
+            f"cd {self.container_dir}/work",
+            "exit_code=0",
+            "bash ../command >> ../stdout.txt 2> >(tee -a ../stderr.txt >&2) || exit_code=$?",
+        ]
+        if self.cfg.has_option("aws", "container_sync") and self.cfg.get_bool(
+            "aws", "container_sync"
+        ):
+            commands.append("find . -type f | xargs sync")
+            commands.append("sync ../stdout.txt ../stderr.txt")
+        commands.append("exit $exit_code")
+
+        container_properties = {
+            "image": image_tag,
+            "volumes": volumes,
+            "mountPoints": mount_points,
+            "command": ["/bin/bash", "-ec", "\n".join(commands)],
+            "resourceRequirements": [
+                {"type": "VCPU", "value": str(vcpu)},
+                {"type": "MEMORY", "value": str(memory_mbytes)},
+            ],
+        }
+
+        if self.cfg["task_runtime"].get_bool("as_user"):
+            user = (
+                f"{self._studio_efs_uid}:{self._studio_efs_uid}"
+                if self._studio_efs_uid is not None
+                else f"{os.geteuid()}:{os.getegid()}"
+            )
+            if user.startswith("0:"):
+                logger.warning(
+                    "container command will run explicitly as root, since you are root and set --as-me"
+                )
+            container_properties["user"] = user
+
+        return container_properties
+
     def _prepare_mounts(self, logger, command):
         """
         Prepare the "volumes" and "mountPoints" for the Batch job definition, assembling the
@@ -271,15 +335,25 @@ class BatchJob(WDL.runtime.task_container.TaskContainer):
         with open(self.host_stderr_txt(), "w"):
             pass
 
-        # FSx mount point
-        volumes = [
-            {
-                "host": {"sourcePath": "/mnt/fsx"},
-                "name": "fsx",
-            }
-        ]
-
-        mount_points = [{"containerPath": self._fs_mount, "sourceVolume": "fsx"}]
+        # # EFS mount point
+        # volumes = [
+        #     {
+        #         "name": "efs",
+        #         "efsVolumeConfiguration": {
+        #             "fileSystemId": self._fs_id,
+        #             "transitEncryption": "ENABLED",
+        #         },
+        #     }
+        # ]
+        # if self._fsap_id:
+        #     volumes[0]["efsVolumeConfiguration"]["authorizationConfig"] = {
+        #         "accessPointId": self._fsap_id
+        #     }
+        # mount_points = [{"containerPath": self._fs_mount, "sourceVolume": "efs"}]
+        if self._filesystem == 'efs':
+            volumes, mount_points = EFS()._find_mount_point()
+        elif self._filesystem == 'fsx':
+            volumes, mount_points = FSxL()._find_mount_point()
 
         if self._inputs_copied:
             return volumes, mount_points
@@ -298,6 +372,30 @@ class BatchJob(WDL.runtime.task_container.TaskContainer):
             symlink_force(host_fn, container_fn)
 
         return volumes, mount_points
+
+    @abstractmethod
+    def _find_mount_point(self):
+        """
+        Abstract method. It will be defined in the specific subclass for preparing mounting points for different filesystem.
+        """
+        pass
+
+    def _cleanup_job_definition(self, logger, cleanup, aws_batch, job_def_handle):
+        def deregister(logger, aws_batch, job_def_handle):
+            try:
+                aws_batch.deregister_job_definition(jobDefinition=job_def_handle)
+                logger.debug(_("deregistered Batch job definition", jobDefinition=job_def_handle))
+            except botocore.exceptions.ClientError as exn:
+                # AWS expires job definitions after 6mo, so failing to delete them isn't fatal
+                logger.warning(
+                    _(
+                        "failed to deregister Batch job definition",
+                        jobDefinition=job_def_handle,
+                        error=str(AWSError(exn)),
+                    )
+                )
+
+        cleanup.callback(deregister, logger, aws_batch, job_def_handle)
 
     def _await_batch_job(self, logger, cleanup, aws_batch, job_id, terminating):
         """
@@ -395,6 +493,45 @@ class BatchJob(WDL.runtime.task_container.TaskContainer):
                 return max(1.0, c - t / b)
         return 1.0
 
+class EFS(BatchJob):
+
+    def _find_mount_point(self):
+        """
+        EFS mount point
+        """
+        volumes = [
+            {
+                "name": "efs",
+                "efsVolumeConfiguration": {
+                    "fileSystemId": self._fs_id,
+                    "transitEncryption": "ENABLED",
+                },
+            }
+        ]
+        if self._fsap_id:
+            volumes[0]["efsVolumeConfiguration"]["authorizationConfig"] = {
+                "accessPointId": self._fsap_id
+            }
+        mount_points = [{"containerPath": self._fs_mount, "sourceVolume": "efs"}]
+        return volumes, mount_points
+
+class FSxL(BatchJob):
+    """
+    FSxL specific subclass
+    """
+
+    def _find_mount_point(self):
+        """
+        FSx Lustre mount point
+        """
+        volumes = [
+            {
+                "host": {"sourcePath": self._fs_mount},
+                "name": "fsx",
+            }
+        ]
+        mount_points = [{"containerPath": self._fs_mount, "sourceVolume": "fsx"}]
+        return volumes, mount_points
 
 class BatchJobDescriber:
     """
